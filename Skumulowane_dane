@@ -1,0 +1,173 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from CoolProp.HumidAirProp import HAPropsSI
+import os
+from datetime import timedelta
+from matplotlib.dates import DateFormatter
+
+# Sciezki
+desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+file_path1 = os.path.join(desktop_path, "DO_Raport_modified.xlsx")
+file_path2 = os.path.join(desktop_path, "doraportu_2.xlsx")
+output_base_folder = os.path.join(desktop_path, "python_test")
+
+if not os.path.exists(output_base_folder):
+    os.makedirs(output_base_folder)
+run_number = 1
+while os.path.exists(os.path.join(output_base_folder, f"run{run_number}")):
+    run_number += 1
+output_folder = os.path.join(output_base_folder, f"run{run_number}")
+os.makedirs(output_folder)
+print(f"✅ Utworzono folder: {output_folder}")
+
+def load_and_prepare_data(file_path):
+    try:
+        df = pd.read_excel(file_path, engine="openpyxl")
+        print(f"✅ Plik {os.path.basename(file_path)} wczytany poprawnie!")
+
+        expected_columns = ["t_1", "t_2", "t_3", "t_4", "t_5", "rh_1", "rh_2", "rh_3", "rh_4", "rh_5",
+                            "t_ssania", "t_tloczenie", "p_ssania", "p_tloczenia",
+                            "t_parowania", "t_skraplania", "Moc_Czynna",
+                            "Moc_Bierna", "Moc_Pozorna", "predkosc_wentylatora",
+                            "nast_spr", "nawiew", "wywiew"]
+
+        if len(df.columns) == len(expected_columns) + 1:
+            df.columns = ["data_i_godzina"] + expected_columns
+            print("✅ Nazwy kolumn poprawnie przypisane.")
+            for col in ["t_1", "t_2", "t_3", "t_4", "t_5", "p_ssania", "p_tloczenia"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            print(f"⚠️ Blad: Oczekiwano {len(expected_columns) + 1} kolumn, a w pliku jest {len(df.columns)} kolumn.")
+            return None
+
+        df["data_i_godzina"] = pd.to_datetime(df["data_i_godzina"], format="%d.%m.%Y %H:%M:%S")
+        df.set_index("data_i_godzina", inplace=True)
+        return df
+
+    except Exception as e:
+        print(f"❌ Blad przy wczytywaniu {file_path}: {e}")
+        return None
+
+df1 = load_and_prepare_data(file_path1)
+df2 = load_and_prepare_data(file_path2)
+
+if df1 is not None and df2 is not None:
+    df = pd.concat([df1, df2]).sort_index()
+    print("✅ Dane z obu plikow polaczone poprawnie.")
+
+    df["hours"] = (df.index - df.index[0]).total_seconds() / 3600
+
+    for i in range(1, 6):
+        temp_col, rh_col, enthalpy_col = f"t_{i}", f"rh_{i}", f"i_{i}"
+        if temp_col in df.columns and rh_col in df.columns:
+            try:
+                df[enthalpy_col] = df.apply(
+                    lambda row: HAPropsSI("H", "T", row[temp_col] + 273.15, "P", 101325, "R", row[rh_col]) / 1000,
+                    axis=1)
+            except Exception:
+                df[enthalpy_col] = np.nan
+
+    if "i_2" in df.columns and "i_3" in df.columns:
+        df["delta_i"] = df["i_2"] - df["i_3"]
+
+    df["time_diff"] = df.index.to_series().diff().dt.total_seconds().div(3600).fillna(0)
+    df["block_active"] = (df["nawiew"] == 1) | (df["wywiew"] == 1)
+
+    mask_Q = (df['nast_spr'] > 0.00) & (df['nawiew'] == 1) & (df['wywiew'] == 0) & df['delta_i'].notna()
+    df['Q_total'] = 0.389 * df['delta_i'] * df['time_diff'] * mask_Q
+
+    mask_P = (df['nast_spr'] > 0.00) & (df['block_active'])
+    P_mean = df['Moc_Czynna'] / 1000
+
+    df['P_total'] = (P_mean + (df['wywiew'] == 1) * 0.45) * df['time_diff'] * mask_P
+    df['P_total2'] = P_mean * df['time_diff'] * mask_P
+
+    Q_cumsum = df['Q_total'].cumsum()
+    P_cumsum = df['P_total'].cumsum()
+    P_cumsum2 = df['P_total2'].cumsum()
+
+    df['COP'] = Q_cumsum / P_cumsum.replace(0, np.nan)
+    df['COP2'] = Q_cumsum / P_cumsum2.replace(0, np.nan)
+
+    df['COP_smooth'] = df['COP'].rolling(window=10, min_periods=1, center=True).mean()
+    df['COP2_smooth'] = df['COP2'].rolling(window=10, min_periods=1, center=True).mean()
+
+    time_gaps = df.index.to_series().diff() > timedelta(hours=3)
+    gap_starts = df.index[time_gaps]
+    gap_ends = df.index[np.roll(time_gaps, -1)]
+    gaps = list(zip(gap_starts, gap_ends))
+
+    def plot_cop_segments(x, y, moc_czynna, ylabel, title, filename):
+        plt.figure(figsize=(15, 6))
+        threshold = 2  # godziny
+        is_off = moc_czynna.rolling(window=1).mean() == 0
+        segments = []
+        start_idx = 0
+
+        for i in range(1, len(is_off)):
+            if is_off.iloc[i] != is_off.iloc[i - 1]:
+                segments.append((start_idx, i - 1, is_off.iloc[i - 1]))
+                start_idx = i
+        segments.append((start_idx, len(is_off) - 1, is_off.iloc[-1]))
+
+        for start, end, off in segments:
+            linestyle = '--' if off and (x.iloc[end] - x.iloc[start]) > threshold else '-'
+            label = 'Praca bez sprężarki' if linestyle == '--' else 'Praca sprężarki'
+            plt.plot(x.iloc[start:end + 1], y.iloc[start:end + 1], linestyle, label=label if start == 0 else "")
+
+        plt.xlabel("Czas pracy [h]")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.grid()
+        plt.legend()
+        xticks = np.arange(0, x.max(), 24)
+        plt.xticks(xticks, [f"{int(v)}" for v in xticks])
+        plt.xlim(left=0, right=x.max())
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_folder, filename))
+        plt.close()
+
+    def plot_single_axis(x, y, ylabel, title, filename):
+        plt.figure(figsize=(15, 6))
+        plt.plot(x, y, label=ylabel)
+        plt.xlabel("Czas pracy [h]")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.grid()
+        plt.legend()
+        xticks = np.arange(0, x.max(), 24)
+        plt.xticks(xticks, [f"{int(v)}" for v in xticks])
+        plt.xlim(left=0, right=x.max())
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_folder, filename))
+        plt.close()
+
+    def plot_two_lines(x, y1, y2, label1, label2, ylabel, title, filename):
+        plt.figure(figsize=(15, 6))
+        plt.plot(x, y1, label=label1)
+        plt.plot(x, y2, label=label2)
+        plt.xlabel("Czas pracy [h]")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.grid()
+        plt.legend()
+        xticks = np.arange(0, x.max(), 24)
+        plt.xticks(xticks, [f"{int(v)}" for v in xticks])
+        plt.xlim(left=0, right=x.max())
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_folder, filename))
+        plt.close()
+
+    t3_smooth = df["t_3"].rolling(window=10, min_periods=1, center=True).mean()
+    p_ssania_smooth = df["p_ssania"].rolling(window=10, min_periods=1, center=True).mean()
+    p_tloczenia_smooth = df["p_tloczenia"].rolling(window=10, min_periods=1, center=True).mean()
+
+    plot_cop_segments(df['hours'], df['COP_smooth'], df['Moc_Czynna'], "COP", "COP z mocą stałą", "cop_z_moca_stala.svg")
+    plot_cop_segments(df['hours'], df['COP2_smooth'], df['Moc_Czynna'], "COP", "COP bez mocy stałej", "cop_bez_mocy_stalej.svg")
+    plot_single_axis(df['hours'], t3_smooth, "Temperatura T3 [°C]", "Temperatura T3", "t3_dual.svg")
+    plot_two_lines(df['hours'], p_ssania_smooth, p_tloczenia_smooth, "Ciśnienie ssania [bar]", "Ciśnienie tłoczenia [bar]", "Ciśnienie [bar]", "Ciśnienie ssania i tłoczenia", "cisnienia_ss_tl.svg")
+
+    print(f"✅ Wygenerowano wszystkie wykresy w folderze: {output_folder}")
+else:
+    print("❌ Nie mozna kontynuowac obliczen z powodu bledow w wczytywaniu danych.")
